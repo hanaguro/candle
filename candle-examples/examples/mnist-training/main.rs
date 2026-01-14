@@ -62,11 +62,11 @@ impl Model for Mlp {
 
 #[derive(Debug)]
 struct ConvNet {
-    conv1: Conv2d,
-    conv2: Conv2d,
-    fc1: Linear,
-    fc2: Linear,
-    dropout: candle_nn::Dropout,
+    conv1: Conv2d,  // 第1畳み込み層【役割：原始的な特徴の抽出】
+    conv2: Conv2d,  // 第2畳み込み層【役割：複雑なパターンの抽出】
+    fc1: Linear,    // 第1全結合層【役割：抽出された特徴の整理・統合】
+    fc2: Linear,    // 第2全結合層【役割：最終的な判定（0〜9の仕分け）】
+    dropout: candle_nn::Dropout,    // ドロップアウト【役割：過学習の防止（カンニング防止）】
 }
 
 impl ConvNet {
@@ -75,6 +75,15 @@ impl ConvNet {
         let conv2 = candle_nn::conv2d(32, 64, 5, Default::default(), vs.pp("c2"))?;
         let fc1 = candle_nn::linear(1024, 1024, vs.pp("fc1"))?;
         let fc2 = candle_nn::linear(1024, LABELS, vs.pp("fc2"))?;
+        // スタート 入力画像    (初期値)    28x28
+        // 第1段階  conv1       28-5+1      24x24
+        // 第2段階  ブーリング  24/2        12x12
+        // 第3段階  conv2       12-5+1      8x8
+        // 第4段階  ブーリング  8/2         4x4
+        // 
+        // 64枚の特徴マップ(conv2の出力)
+        // 各マップのサイズが4x4ピクセル
+        // 合計：64x4x4=1024
         let dropout = candle_nn::Dropout::new(0.5);
         Ok(Self {
             conv1,
@@ -86,16 +95,16 @@ impl ConvNet {
     }
 
     fn forward(&self, xs: &Tensor, train: bool) -> Result<Tensor> {
-        let (b_sz, _img_dim) = xs.dims2()?;
+        let (b_sz, _img_dim) = xs.dims2()?; // b_sz: バッチサイズ、_img_dim: Image Dimension
         let xs = xs
-            .reshape((b_sz, 1, 28, 28))?
-            .apply(&self.conv1)?
-            .max_pool2d(2)?
-            .apply(&self.conv2)?
-            .max_pool2d(2)?
-            .flatten_from(1)?
-            .apply(&self.fc1)?
-            .relu()?;
+            .reshape((b_sz, 1, 28, 28))?    // 形を復元する(784 -> 28x28x1)
+            .apply(&self.conv1)?    // 32種類のフィルターをかけ、画像から「エッジ(線)」などを抽出
+            .max_pool2d(2)?         // 2x2の範囲から最大の値だけを取り出す
+            .apply(&self.conv2)?    // 抽出された「線」を組み合わせて、さらに複雑な「角」や「カーブ」を抽出(64種類)
+            .max_pool2d(2)?         // 再び解像度を半分(8->4)にする
+            .flatten_from(1)?       // (64, 4, 4)を、再び1列のデータ(1024個)に平らに並べ直す
+            .apply(&self.fc1)?      // 抽出された 1024 個の特徴すべてを組み合わせて、新しい1024個の「判断材料」を作る
+            .relu()?;               // ReLU(Rectified Linear Unit)関数を適用します。
         self.dropout.forward_t(&xs, train)?.apply(&self.fc2)
     }
 }
@@ -119,7 +128,9 @@ fn training_loop_cnn(
     let train_images = m.train_images.to_device(&dev)?;
     let train_labels = train_labels.to_dtype(DType::U32)?.to_device(&dev)?;
 
+    // VarMapは「畳み込みフィルター」の実体を保持する
     let mut varmap = VarMap::new();
+    // VarBuilder は 「CNNという複雑な建物を建てるための、現場監督（インターフェース）」
     let vs = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
     let model = ConvNet::new(vs.clone())?;
 
