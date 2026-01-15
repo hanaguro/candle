@@ -1,5 +1,5 @@
 [workspace]
-members = [
+members = [ "Takahiro/mnist_test",
     "candle-core",
     "candle-datasets",
     "candle-examples",
