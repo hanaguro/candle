@@ -100,11 +100,20 @@ impl ConvNet {
             .reshape((b_sz, 1, 28, 28))?    // 形を復元する(784 -> 28x28x1)
             .apply(&self.conv1)?    // 32種類のフィルターをかけ、画像から「エッジ(線)」などを抽出
             .max_pool2d(2)?         // 2x2の範囲から最大の値だけを取り出す
+                                    // 画像の解像度をあえて落とし、重要な特徴だけを浮き彫りにする
+                                    // 情報の間引き: 重要な特徴だけを残して、計算を軽くする
+                                    // あそび（余裕）を作る: 多少のズレや形の崩れを許容できるようにする
             .apply(&self.conv2)?    // 抽出された「線」を組み合わせて、さらに複雑な「角」や「カーブ」を抽出(64種類)
             .max_pool2d(2)?         // 再び解像度を半分(8->4)にする
             .flatten_from(1)?       // (64, 4, 4)を、再び1列のデータ(1024個)に平らに並べ直す
             .apply(&self.fc1)?      // 抽出された 1024 個の特徴すべてを組み合わせて、新しい1024個の「判断材料」を作る
-            .relu()?;               // ReLU(Rectified Linear Unit)関数を適用します。
+            .relu()?;               // ReLU(Rectified Linear Unit)関数を適用
+                                    // 情報の整理: 不要なマイナス情報をカットし、重要なプラス情報だけを活かす
+                                    // 知能の付与: 単純な足し算・掛け算の世界に「曲がり」を加え、複雑な判断を可能にする
+                                    // 高速化: 計算が単純なので、大規模なモデルでもサクサク動く
+
+        // forward_t():trainがtrueだと、学習中だけランダムに情報の伝達を遮断
+        // apply():最終的に「0〜9の各数字に対するスコア」を算出
         self.dropout.forward_t(&xs, train)?.apply(&self.fc2)
     }
 }
@@ -146,30 +155,61 @@ fn training_loop_cnn(
     let mut opt = candle_nn::AdamW::new(varmap.all_vars(), adamw_params)?;
     let test_images = m.test_images.to_device(&dev)?;
     let test_labels = m.test_labels.to_dtype(DType::U32)?.to_device(&dev)?;
-    let n_batches = train_images.dim(0)? / BSIZE;
+
+    // train_images.dim(0)もBSIZEも整数なので、n_batchesには小数点以下が切り捨てられた数値が入る
+    let n_batches = train_images.dim(0)? / BSIZE;   
+    // 範囲0..n_batchesの最大値はn_batches-1
+    // train_imagesの最後の方はトレーニングに使用されないことになる
     let mut batch_idxs = (0..n_batches).collect::<Vec<usize>>();
+
     for epoch in 1..=args.epochs {
-        let mut sum_loss = 0f32;
+        let mut sum_loss = 0f32;    // f32(32bit 浮動小数点数)の0
         batch_idxs.shuffle(&mut rng());
         for batch_idx in batch_idxs.iter() {
+            // 巨大な多次元配列（Tensor）の中から、特定の範囲だけを「細長く」切り出す（スライスする）ための操作
             let train_images = train_images.narrow(0, batch_idx * BSIZE, BSIZE)?;
             let train_labels = train_labels.narrow(0, batch_idx * BSIZE, BSIZE)?;
+
+            // 入力された画像データがどの数字（0〜9）に近いか、モデルに推論（計算）させる
             let logits = model.forward(&train_images, true)?;
+
+            // モデルが出力した「生のスコア（Logits）」を、
+            // 「確率の対数（Log-Probability）」という、数学的に扱いやすい形に変換する
+            // D::Minus1 は、一番最後の次元（Dimension）」に対して計算を行うという指定
+            // データの形状: logits は [64, 10] という形をしている（64枚の画像 × 10個の数字スコア）
             let log_sm = ops::log_softmax(&logits, D::Minus1)?;
+
+            // モデルの予測結果（log_sm）と実際の正解（train_labels）を照らし合わせ、
+            // 「モデルがどれだけ間違っていたか」を具体的な数値（損失値）として算出する処理
             let loss = loss::nll(&log_sm, &train_labels)?;
+
+            // 算出された誤差（loss）を元に、モデル内の膨大なパラメーターを微調整して賢くする
+            // 誤差逆伝播 (Backpropagation / 勾配の計算)とパラメータの更新 (Optimization Step)を行なっている
             opt.backward_step(&loss)?;
+
+            // GPU（デバイス）上の計算結果であるTensorから数値を取り出し、
+            // Rust標準の変数（CPU側）にコピーして足し合わせる
+            // to_vec0::<f32>()は、0次元のTensor（スカラー値）を、
+            // Rustのプリミティブ型（この場合は f32）に変換
+            // to_vec0: 「0次元のベクトル（＝ただの数値）」としてデータを取り出すという意味
             sum_loss += loss.to_vec0::<f32>()?;
         }
         let avg_loss = sum_loss / n_batches as f32;
 
         let test_logits = model.forward(&test_images, false)?;
+
         let sum_ok = test_logits
-            .argmax(D::Minus1)?
-            .eq(&test_labels)?
-            .to_dtype(DType::F32)?
-            .sum_all()?
-            .to_scalar::<f32>()?;
+            .argmax(D::Minus1)?     // 各行（各画像）の中で、最もスコアが高かったインデックス（0〜9の番号）を返す
+            .eq(&test_labels)?      // モデルの予測結果と、あらかじめ用意された正解ラベル（test_labels）を1つずつ比較
+            .to_dtype(DType::F32)?  // 前のステップで得られた 0/1（通常は U8 型などの整数）を、f32（浮動小数点数）に変換
+            .sum_all()?             // Tensor 内にあるすべての数値を足し合わせる
+            .to_scalar::<f32>()?;   // GPU 上に存在する 0 次元の Tensor（ただの 1 つの数値）を、
+                                    // Rust 標準の f32 型の変数として取り出し、CPU 側（メモリ）に転送
+
+        // test_labels.dims1()?: テストデータのラベルが格納されているTensor（test_labels）の、
+        // 1次元目の要素数（＝データの総数）を取得
         let test_accuracy = sum_ok / test_labels.dims1()? as f32;
+
         println!(
             "{epoch:4} train loss {:8.5} test acc: {:5.2}%",
             avg_loss,
