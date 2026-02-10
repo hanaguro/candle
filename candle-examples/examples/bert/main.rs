@@ -56,7 +56,7 @@ struct Args {
 }
 
 impl Args {
-    // このResultはanyhow::Result。エラー側の型を書かなくても良い。
+    // このResultはanyhow::Result。Result<(BertModel, Tokenizer), E>というように、エラー側の型を書かなくても良い。
     fn build_model_and_tokenizer(&self) -> Result<(BertModel, Tokenizer)> {
         let device = candle_examples::device(self.cpu)?;
         let default_model = "sentence-transformers/all-MiniLM-L6-v2".to_string();
